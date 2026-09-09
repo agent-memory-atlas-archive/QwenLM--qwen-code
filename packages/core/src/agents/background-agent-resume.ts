@@ -1592,7 +1592,10 @@ export class BackgroundAgentResumeService {
     }
 
     if (subagentConfig.executor !== undefined) {
-      return this.resolveResumeTarget(subagentName, 'acp');
+      return this.resolveResumeTarget(
+        subagentName,
+        subagentConfig.executor.kind,
+      );
     }
     return {
       agentName: subagentConfig.name,

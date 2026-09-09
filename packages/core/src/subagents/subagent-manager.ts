@@ -468,14 +468,6 @@ export class SubagentManager {
     extensionName?: string,
     options?: { assertCanCommit?: () => void },
   ): Promise<void> {
-    // Check if it's a built-in agent first
-    if (BuiltinAgentRegistry.isBuiltinAgent(name)) {
-      throw new SubagentError(
-        `Cannot delete built-in subagent "${name}"`,
-        SubagentErrorCode.INVALID_CONFIG,
-        name,
-      );
-    }
     if (level === 'extension') {
       throw new SubagentError(
         `Cannot delete subagent "${name}" in extension "${extensionName}", If needed, you can directly uninstall extension.`,
@@ -511,9 +503,16 @@ export class SubagentManager {
     }
 
     if (!deleted) {
+      const isBuiltin =
+        (level === undefined || level === 'builtin') &&
+        BuiltinAgentRegistry.isBuiltinAgent(name);
       throw new SubagentError(
-        `Subagent "${name}" not found`,
-        SubagentErrorCode.NOT_FOUND,
+        isBuiltin
+          ? `Cannot delete built-in subagent "${name}"`
+          : `Subagent "${name}" not found`,
+        isBuiltin
+          ? SubagentErrorCode.INVALID_CONFIG
+          : SubagentErrorCode.NOT_FOUND,
         name,
       );
     }
@@ -792,8 +791,8 @@ export class SubagentManager {
       frontmatter['approvalMode'] = config.approvalMode;
     }
 
-    if (config.background) {
-      frontmatter['background'] = true;
+    if (config.background !== undefined) {
+      frontmatter['background'] = config.background;
     }
 
     // CC 2.1.168 declarative-agent fields (round-trip parity).
@@ -938,7 +937,10 @@ export class SubagentManager {
             config.name,
           );
         }
-        if (config.level === 'project' && !runtimeContext.isTrustedFolder()) {
+        if (
+          (config.level === 'project' || config.level === 'builtin') &&
+          !runtimeContext.isTrustedFolder()
+        ) {
           throw new SubagentError(
             `Cannot start external agent "${config.name}" from an untrusted project.`,
             SubagentErrorCode.INVALID_CONFIG,
@@ -1885,7 +1887,11 @@ function parseSubagentContent(
       );
     }
     const background =
-      backgroundRaw === 'true' || backgroundRaw === true ? true : undefined;
+      backgroundRaw === 'true' || backgroundRaw === true
+        ? true
+        : backgroundRaw === 'false' || backgroundRaw === false
+          ? false
+          : undefined;
 
     // --- CC 2.1.168 declarative-agent fields (DL7-parity lenient parse) ---
 
@@ -2063,7 +2069,7 @@ function parseSubagentContent(
     if ((hasExecutor || executorRaw !== undefined) && executor === undefined) {
       throw new SubagentError(
         `Agent file ${filePath} has an invalid executor block (expected ` +
-          `{ kind: 'acp', command: string, args?: string[] }). Refusing to load ` +
+          `{ kind: 'acp' | 'codex', command: string, args?: string[] }). Refusing to load ` +
           `the definition: dropping the block would silently run it in-process ` +
           `instead of in the external agent it asked for.`,
         SubagentErrorCode.INVALID_CONFIG,
@@ -2083,7 +2089,7 @@ function parseSubagentContent(
       runConfig: runConfig as Partial<RunConfig>,
       color,
       level,
-      ...(background ? { background } : {}),
+      ...(background !== undefined ? { background } : {}),
       ...(permissionMode !== undefined ? { permissionMode } : {}),
       ...(maxTurns !== undefined ? { maxTurns } : {}),
       ...(mcpServers !== undefined ? { mcpServers } : {}),

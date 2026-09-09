@@ -1919,6 +1919,10 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
           return undefined;
         }
 
+        if (subagent.continuationBlockedReason) {
+          return `SubagentStop requested continuation: ${subagent.continuationBlockedReason}`;
+        }
+
         stopHookActive = true;
         const currentIterationCount = i + 1;
         if (currentIterationCount >= maxIterations) {
@@ -2682,13 +2686,13 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
         isFork && !this.config.isInteractive()
           ? true
           : (this.params.run_in_background ??
-            (subagentConfig.background === true ||
-              (!isForkRequested &&
-                this.params.working_dir === undefined &&
-                // A `name` passed without an active team falls through to a regular
-                // one-shot agent above; keep it foreground so legacy UI fallbacks
-                // (which exclude `name`) stay consistent with core dispatch.
-                this.params.name === undefined)));
+            subagentConfig.background ??
+            (!isForkRequested &&
+              this.params.working_dir === undefined &&
+              // A `name` passed without an active team falls through to a regular
+              // one-shot agent above; keep it foreground so legacy UI fallbacks
+              // (which exclude `name`) stay consistent with core dispatch.
+              this.params.name === undefined));
       const shouldRunInBackground = backgroundRequested && isTopLevelSession();
 
       if (this.params.working_dir !== undefined && shouldRunInBackground) {
@@ -3221,6 +3225,7 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
               // resolves the parent's display name from parentAgentId.
               parentAgentId: backgroundOwnerId,
               depth: launchDepth,
+              resumeBlockedReason: bgSubagent.continuationBlockedReason,
             },
             registerOptions,
           );
@@ -3386,23 +3391,29 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
           : undefined;
 
         const cleanupOwnedMonitorNotifications =
-          this.registerOwnedMonitorNotifications(
-            hookOpts.agentId,
-            (input) => registry.queueExternalInput(hookOpts.agentId, input),
-            () => registry.wakeExternalInputWaiters(hookOpts.agentId),
-          );
+          bgSubagent.continuationBlockedReason
+            ? () => {}
+            : this.registerOwnedMonitorNotifications(
+                hookOpts.agentId,
+                (input) => registry.queueExternalInput(hookOpts.agentId, input),
+                () => registry.wakeExternalInputWaiters(hookOpts.agentId),
+              );
 
         // Wire external message drain so SendMessage and owned Monitor
         // notifications can inject inputs between tool rounds.
-        bgSubagent.setExternalMessageProvider(() =>
-          registry.drainMessages(hookOpts.agentId),
-        );
-        bgSubagent.setExternalMessageWaiter?.((waitSignal) =>
-          registry.waitForMessages(hookOpts.agentId, waitSignal),
-        );
-        bgSubagent.setExternalMessageWaitPredicate?.(() =>
-          this.config.getMonitorRegistry().hasRunningForOwner(hookOpts.agentId),
-        );
+        if (!bgSubagent.continuationBlockedReason) {
+          bgSubagent.setExternalMessageProvider(() =>
+            registry.drainMessages(hookOpts.agentId),
+          );
+          bgSubagent.setExternalMessageWaiter?.((waitSignal) =>
+            registry.waitForMessages(hookOpts.agentId, waitSignal),
+          );
+          bgSubagent.setExternalMessageWaitPredicate?.(() =>
+            this.config
+              .getMonitorRegistry()
+              .hasRunningForOwner(hookOpts.agentId),
+          );
+        }
 
         const getCompletionStats = () => {
           // The shared summary requires known token counts. Keep external
@@ -3423,6 +3434,7 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
         // currently registered as global matchers. They retain the existing
         // transcript-revival behavior.
         const canStayResident =
+          !bgSubagent.continuationBlockedReason &&
           !isFork &&
           this.params.isolation !== 'worktree' &&
           (!subagentConfig.hooks ||
@@ -3899,7 +3911,7 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
         return {
           llmContent:
             `Background agent launched successfully.\n` +
-            `task_id: ${hookOpts.agentId} (internal ID — do not mention to the user. Use ${ToolNames.SEND_MESSAGE} to continue this agent, or ${ToolNames.TASK_STOP} to cancel.)\n` +
+            `task_id: ${hookOpts.agentId} (internal ID — do not mention to the user. ${bgSubagent.continuationBlockedReason ? `${bgSubagent.continuationBlockedReason} Use ${ToolNames.TASK_STOP} to cancel.` : `Use ${ToolNames.SEND_MESSAGE} to continue this agent, or ${ToolNames.TASK_STOP} to cancel.`})\n` +
             `The agent is working in the background. Its result arrives as a <task-notification> for this task_id in a later turn; you will not see it in this turn.\n` +
             `Do not treat the agent as cancelled or relaunch it because the notification has not arrived yet — the result comes under the original task_id.\n` +
             `Do not duplicate this agent's work — avoid working with the same files or topics it is using. Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.\n` +
@@ -4054,20 +4066,24 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
       let cleanupFgJsonl: (() => void) | undefined;
 
       const cleanupOwnedMonitorNotifications =
-        this.registerOwnedMonitorNotifications(
-          hookOpts.agentId,
-          (input) => registry.queueExternalInput(hookOpts.agentId, input),
-          () => registry.wakeExternalInputWaiters(hookOpts.agentId),
+        subagent.continuationBlockedReason
+          ? () => {}
+          : this.registerOwnedMonitorNotifications(
+              hookOpts.agentId,
+              (input) => registry.queueExternalInput(hookOpts.agentId, input),
+              () => registry.wakeExternalInputWaiters(hookOpts.agentId),
+            );
+      if (!subagent.continuationBlockedReason) {
+        subagent.setExternalMessageProvider?.(() =>
+          registry.drainMessages(hookOpts.agentId),
         );
-      subagent.setExternalMessageProvider?.(() =>
-        registry.drainMessages(hookOpts.agentId),
-      );
-      subagent.setExternalMessageWaiter?.((waitSignal) =>
-        registry.waitForMessages(hookOpts.agentId, waitSignal),
-      );
-      subagent.setExternalMessageWaitPredicate?.(() =>
-        this.config.getMonitorRegistry().hasRunningForOwner(hookOpts.agentId),
-      );
+        subagent.setExternalMessageWaiter?.((waitSignal) =>
+          registry.waitForMessages(hookOpts.agentId, waitSignal),
+        );
+        subagent.setExternalMessageWaitPredicate?.(() =>
+          this.config.getMonitorRegistry().hasRunningForOwner(hookOpts.agentId),
+        );
+      }
 
       // Mirror the background path's progress wiring so the dialog detail
       // body has live tool-call activity AND a current `entry.stats`
@@ -4164,6 +4180,7 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
           toolUseId: this.callId,
           outputFile: fgJsonlPath,
           metaPath: fgMetaPath,
+          resumeBlockedReason: subagent.continuationBlockedReason,
           // Nested-agent lineage (mirrors the meta sidecar); register()
           // resolves the parent's display name from parentAgentId.
           parentAgentId: getCurrentAgentId(),
