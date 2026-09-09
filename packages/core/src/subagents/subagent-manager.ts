@@ -480,6 +480,7 @@ export class SubagentManager {
       ? [level]
       : ['project', 'user'];
     let deleted = false;
+    let deleteError: SubagentError | undefined;
 
     // Assert once before any deletion so a closed generation fails atomically
     // instead of unlinking some level files and then throwing mid-loop.
@@ -496,16 +497,19 @@ export class SubagentManager {
         try {
           await fs.unlink(config.filePath);
           deleted = true;
-        } catch (_error) {
-          // File might not exist or be accessible, continue
+        } catch (error) {
+          deleteError = new SubagentError(
+            `Failed to delete subagent file: ${error instanceof Error ? error.message : String(error)}`,
+            SubagentErrorCode.FILE_ERROR,
+            name,
+          );
         }
       }
     }
 
     if (!deleted) {
-      const isBuiltin =
-        (level === undefined || level === 'builtin') &&
-        BuiltinAgentRegistry.isBuiltinAgent(name);
+      if (deleteError) throw deleteError;
+      const isBuiltin = BuiltinAgentRegistry.isBuiltinAgent(name);
       throw new SubagentError(
         isBuiltin
           ? `Cannot delete built-in subagent "${name}"`

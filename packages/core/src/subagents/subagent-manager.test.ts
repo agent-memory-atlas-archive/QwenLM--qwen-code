@@ -2015,9 +2015,34 @@ You are a helpful assistant.`;
         await expect(manager.deleteSubagent(name)).rejects.toThrow(
           /Cannot delete built-in/,
         );
+        await expect(
+          manager.deleteSubagent(name, 'project'),
+        ).rejects.toMatchObject({
+          code: SubagentErrorCode.INVALID_CONFIG,
+        });
         expect(fs.unlink).not.toHaveBeenCalled();
       },
     );
+
+    it('reports a file error when a custom builtin-name definition cannot be deleted', async () => {
+      vi.mocked(fs.readdir).mockResolvedValue(['codex.md'] as never);
+      vi.mocked(fs.readFile).mockResolvedValue(
+        '---\nname: codex\ndescription: Custom native agent\n---\nInspect.',
+      );
+      mockParseYaml.mockReturnValue({
+        name: 'codex',
+        description: 'Custom native agent',
+      });
+      vi.mocked(fs.unlink).mockRejectedValue(
+        Object.assign(new Error('permission denied'), { code: 'EACCES' }),
+      );
+      await expect(
+        manager.deleteSubagent('codex', 'project'),
+      ).rejects.toMatchObject({
+        code: SubagentErrorCode.FILE_ERROR,
+        message: expect.stringContaining('permission denied'),
+      });
+    });
 
     it('should delete subagent from specified level', async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

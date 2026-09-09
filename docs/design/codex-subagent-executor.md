@@ -56,8 +56,10 @@ transcripts and user-facing task controls keep the baseline implementation.
 
 Native builtins require a trusted workspace and are unavailable in safe mode.
 Codex uses the effective approval mode resolved by the manager's existing rules:
-default/plan maps to read-only, auto-edit to workspace-write, and yolo to native
-sandbox bypass. Other modes fail before startup. Approval requests and human
+default/plan maps to read-only, auto/auto-edit to workspace-write, and yolo to
+native sandbox bypass. Ordinary trusted sessions resolve to auto; a trusted
+default-mode parent without an agent override resolves to auto-edit. Other
+effective modes fail before startup. Approval requests and human
 input are denied; native tool permissions are not Qwen tool-rule enforcement.
 
 Validate the initialization response, ephemeral thread acknowledgment, associated
@@ -66,8 +68,11 @@ results and protocol errors cannot count as success. Initialization has a
 10-second deadline; optional `runConfig.max_time_minutes` bounds execution.
 Already cancelled calls do not start a product. Cancellation, timeout and failure
 release pending requests and await process cleanup before the executor returns.
-Cleanup failures propagate to the shared lifecycle. Cancellation does not undo
-workspace edits.
+After root exit, output draining is limited to 10 seconds. A completed answer
+survives cancellation during cleanup, with the task still marked cancelled.
+Cleanup failures propagate to the shared lifecycle, except the initial
+process-tree snapshot race: as in ACP, it reports an unproven-tree diagnostic
+without replacing the task outcome. Cancellation does not undo workspace edits.
 
 ## Validation and acceptance
 

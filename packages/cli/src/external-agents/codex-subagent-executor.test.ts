@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ProcessRegistry } from '@qwen-code/acp-bridge/processRegistry';
 import { Config } from '@qwen-code/qwen-code-core';
 import {
   AgentEventEmitter,
@@ -26,7 +27,7 @@ import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 const scenario = process.argv[1];
 if (scenario.startsWith('slow-')) process.on('SIGTERM', () => {
-  if (scenario === 'slow-error') writeFileSync(process.argv[2], 'cleaning');
+  writeFileSync(process.argv[2], 'cleaning');
 });
 let thread;
 let task;
@@ -40,8 +41,15 @@ const finish = () => {
   if (scenario !== 'missing-answer') notify('item/completed', {
     turnId: scenario === 'wrong-turn' ? 'foreign' : 'turn',
     item:{type:'agentMessage',phase: scenario === 'unphased' ? null : 'final_answer',
-      text:JSON.stringify({thread,task,pid:process.pid,descendant,interaction,env:process.env.CODEX_THREAD_ID ?? null})}
+      text:JSON.stringify({thread,task,pid:process.pid,descendant,interaction,env:process.env.CODEX_THREAD_ID ?? null,
+        padding:scenario === 'exit' ? 'x'.repeat(1_500_000) : undefined})}
   });
+  if (scenario === 'unterminated' || scenario === 'exit') {
+    const terminal = JSON.stringify({method:'turn/completed',params:{threadId:'thread',turn:{id:'turn',status:'completed'}}});
+    return process.stdout.end(terminal + (scenario === 'exit' ? '\n' : ''), () => {
+      if (scenario === 'exit') process.exit(0);
+    });
+  }
   notify('turn/completed', {turn:{id:'turn',status: scenario === 'failed' ? 'failed' : 'completed'}});
 };
 createInterface({input:process.stdin}).on('line', line => {
@@ -56,15 +64,28 @@ createInterface({input:process.stdin}).on('line', line => {
   }
   if (frame.method === 'turn/start') {
     task = frame.params;
+    if (scenario === 'missing-reply') {
+      finish();
+      return process.stdout.end();
+    }
     reply(frame.id, {turn:{id:'turn'}});
     if (scenario.startsWith('slow-')) {
       writeFileSync(process.argv[2], 'ready');
       if (scenario === 'slow-error') process.stdout.write('invalid json\n');
+      if (scenario === 'slow-finish') finish();
       return;
     }
     if (scenario === 'hold') return;
     if (scenario === 'bad-json') return process.stdout.write('invalid json\n');
     if (scenario === 'close') return process.stdout.end();
+    if (scenario === 'exit-held-pipe') {
+      setTimeout(() => {
+        const child = spawn(process.execPath, ['-e','process.send("ready");setInterval(()=>{},1000)'], {detached:true,stdio:['ignore',1,'ignore','ipc']});
+        writeFileSync(process.argv[2], String(child.pid));
+        child.once('message', () => process.exit(0));
+      }, 300);
+      return;
+    }
     if (scenario === 'tree') {
       const child = spawn(process.execPath, ['-e','process.on("SIGTERM",()=>{});process.send("ready");setInterval(()=>{},1000)'], {stdio:['ignore','ignore','ignore','ipc']});
       descendant = child.pid;
@@ -138,10 +159,32 @@ function context(): ContextState {
   return state;
 }
 
-describe('Codex subagent executor', () => {
+function injectCleanupError(message: string): void {
+  const reserve = ProcessRegistry.prototype.reserve;
+  vi.spyOn(ProcessRegistry.prototype, 'reserve').mockImplementation(function (
+    this: ProcessRegistry,
+  ) {
+    const reservation = reserve.call(this);
+    const attach = reservation.attach;
+    reservation.attach = (...args) => {
+      const tracked = attach(...args);
+      const terminate = tracked.terminate.bind(tracked);
+      vi.spyOn(tracked, 'terminate').mockImplementation(async () => {
+        await terminate().catch(() => {});
+        throw new Error(message);
+      });
+      return tracked;
+    };
+    return reservation;
+  });
+}
+
+// These subprocess fixtures require POSIX signals and process-group cleanup.
+describe.skipIf(process.platform === 'win32')('Codex subagent executor', () => {
   it.each([
     ['default', 'read-only'],
     ['plan', 'read-only'],
+    ['auto', 'workspace-write'],
     ['auto-edit', 'workspace-write'],
     ['yolo', 'danger-full-access'],
   ])(
@@ -179,13 +222,17 @@ describe('Codex subagent executor', () => {
     },
   );
 
-  it.each(['unphased', 'approval'])(
+  it.each(['unphased', 'approval', 'unterminated', 'exit'])(
     'accepts %s completion with a final answer',
     async (scenario) => {
       const executor = await create(params(scenario));
       await executor.execute(context());
       expect(executor.getTerminateMode()).toBe(AgentTerminateMode.GOAL);
       expect(JSON.parse(executor.getFinalText()).task.threadId).toBe('thread');
+      if (scenario === 'exit')
+        expect(JSON.parse(executor.getFinalText()).padding).toBe(
+          'x'.repeat(1_500_000),
+        );
     },
   );
 
@@ -216,6 +263,7 @@ describe('Codex subagent executor', () => {
     ['bad-json', /JSON/],
     ['durable', /ephemeral/],
     ['close', /closed before completion/],
+    ['missing-reply', /closed before completion/],
     ['unknown-request', /unsupported interaction/],
   ])('fails %s instead of publishing success', async (scenario, error) => {
     const executor = await create(params(scenario));
@@ -261,7 +309,7 @@ describe('Codex subagent executor', () => {
     expect(executor.getFinalText()).toContain('exceeded its time limit');
   });
 
-  it.each(['slow-hold', 'slow-error'])(
+  it.each(['slow-hold', 'slow-error', 'slow-finish'])(
     'preserves the original outcome during %s cleanup',
     async (scenario) => {
       const directory = await mkdtemp(join(tmpdir(), 'codex-cleanup-'));
@@ -270,6 +318,8 @@ describe('Codex subagent executor', () => {
       options.spec.args!.push(ready);
       options.runConfig = { max_time_minutes: 0.02 };
       const executor = await create(options);
+      const roundText = vi.fn();
+      options.eventEmitter!.on(AgentEventType.ROUND_TEXT, roundText);
       const abort = new AbortController();
       const execution = executor.execute(context(), abort.signal);
       const settled = execution.then(
@@ -279,16 +329,24 @@ describe('Codex subagent executor', () => {
       try {
         await vi.waitFor(() => {
           expect(existsSync(ready)).toBe(true);
-          if (scenario === 'slow-error')
+          if (scenario !== 'slow-hold')
             expect(readFileSync(ready, 'utf8')).toBe('cleaning');
         });
         abort.abort();
         const error = await settled;
-        if (scenario === 'slow-hold') {
+        if (scenario !== 'slow-error') {
           expect(error).toBeUndefined();
           expect(executor.getTerminateMode()).toBe(
             AgentTerminateMode.CANCELLED,
           );
+          if (scenario === 'slow-finish') {
+            const result = JSON.parse(executor.getFinalText());
+            expect(result.task.threadId).toBe('thread');
+            expect(() => process.kill(result.pid, 0)).toThrow();
+            expect(roundText).toHaveBeenCalledWith(
+              expect.objectContaining({ text: executor.getFinalText() }),
+            );
+          }
         } else {
           expect(error).toBeInstanceOf(Error);
           expect(executor.getTerminateMode()).toBe(AgentTerminateMode.ERROR);
@@ -302,6 +360,72 @@ describe('Codex subagent executor', () => {
     },
     15_000,
   );
+
+  it.each(['normal', 'hold'])(
+    'reports an unproven initial snapshot without replacing the %s outcome',
+    async (scenario) => {
+      injectCleanupError(
+        'ACP child pid=1 exited before its initial process-tree snapshot completed',
+      );
+      const options = params(scenario);
+      const onError = vi.fn();
+      options.eventEmitter!.on(AgentEventType.ERROR, onError);
+      const executor = await create(options);
+      const abort = new AbortController();
+      const execution = executor.execute(context(), abort.signal);
+      if (scenario === 'hold') setTimeout(() => abort.abort(), 200);
+      await execution;
+      expect(executor.getTerminateMode()).toBe(
+        scenario === 'normal'
+          ? AgentTerminateMode.GOAL
+          : AgentTerminateMode.CANCELLED,
+      );
+      if (scenario === 'normal')
+        expect(JSON.parse(executor.getFinalText()).task.threadId).toBe(
+          'thread',
+        );
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: expect.stringContaining('process tree not proven gone'),
+        }),
+      );
+    },
+  );
+
+  it.each([
+    'process-tree snapshot failed: unavailable ps',
+    'process-tree snapshot exceeded 256 processes or depth 8',
+    'did not exit with its owned process groups within 10000ms (surviving pgids=1)',
+  ])('propagates a genuine cleanup failure: %s', async (message) => {
+    injectCleanupError(`ACP child pid=1 ${message}`);
+    const executor = await create();
+    await expect(executor.execute(context())).rejects.toThrow(message);
+    expect(executor.getTerminateMode()).toBe(AgentTerminateMode.ERROR);
+  });
+
+  it('bounds output draining when an exited root leaves an open pipe', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-held-pipe-'));
+    const pidFile = join(directory, 'pid');
+    const options = params('exit-held-pipe');
+    options.spec.args!.push(pidFile);
+    const executor = await create(options);
+    try {
+      await expect(executor.execute(context())).rejects.toThrow(
+        /exited before completion/,
+      );
+      expect(executor.getTerminateMode()).toBe(AgentTerminateMode.ERROR);
+    } finally {
+      await executor.dispose?.();
+      if (existsSync(pidFile)) {
+        try {
+          process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL');
+        } catch (error) {
+          expect((error as NodeJS.ErrnoException).code).toBe('ESRCH');
+        }
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 25_000);
 
   it('bounds initialization even without a configured task limit', async () => {
     const executor = await create(params('init-hang'));
@@ -329,9 +453,9 @@ describe('Codex subagent executor', () => {
   });
 
   it('rejects unsupported approval modes and untrusted workspaces before spawning', async () => {
-    await expect(create({ ...params(), approvalMode: 'auto' })).rejects.toThrow(
-      /approval mode/,
-    );
+    await expect(
+      create({ ...params(), approvalMode: 'invalid' }),
+    ).rejects.toThrow(/approval mode/);
     const options = params();
     vi.mocked(options.runtimeContext.isTrustedFolder).mockReturnValue(false);
     await expect(create(options)).rejects.toThrow(/trusted workspace/);

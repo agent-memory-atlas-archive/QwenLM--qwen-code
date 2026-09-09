@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { ProcessRegistry } from '@qwen-code/acp-bridge/processRegistry';
 import { sanitizeChildEnv } from '@qwen-code/qwen-code-core';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
 import {
   AgentEventEmitter,
   AgentEventType,
@@ -21,8 +22,12 @@ import {
   type SubagentExecutor,
   type SubagentExecutorCore,
 } from '@qwen-code/qwen-code-core/subagentRuntime';
-import { isExpectedExternalAgentCleanupExit } from './acp-subagent-executor.js';
+import {
+  isExpectedExternalAgentCleanupExit,
+  isUnprovenExternalAgentTreeExit,
+} from './acp-subagent-executor.js';
 
+const debugLogger = createDebugLogger('EXTERNAL_AGENT');
 type JsonObject = Record<string, unknown>;
 class CodexInterruption extends Error {
   constructor(
@@ -86,6 +91,8 @@ async function runCodex(
   let turnId: string | undefined;
   let finalAnswer: string | undefined;
   let unphasedAnswer: string | undefined;
+  let terminal = false;
+  let exitDrainTimer: ReturnType<typeof setTimeout> | undefined;
   let fail!: (error: Error) => void;
   const failure = new Promise<never>((_resolve, reject) => {
     fail = reject;
@@ -123,9 +130,17 @@ async function runCodex(
       ),
     );
   });
-  child.once('exit', (code, exitSignal) =>
-    fail(new Error(`Codex exited before completion (${exitSignal ?? code}).`)),
-  );
+  const onExit = (code: number | null, exitSignal: NodeJS.Signals | null) => {
+    // Drain buffered output, but do not wait forever on a descendant's pipe.
+    exitDrainTimer = setTimeout(
+      () =>
+        fail(
+          new Error(`Codex exited before completion (${exitSignal ?? code}).`),
+        ),
+      10_000,
+    );
+  };
+  child.once('exit', onExit);
   child.stdin.on('error', () => fail(new Error('Codex input stream closed.')));
   child.stdout.on('error', () =>
     fail(new Error('Codex output stream failed.')),
@@ -196,7 +211,10 @@ async function runCodex(
       if (method === 'turn/started' || method === 'turn/completed') {
         const turn = object(parameters['turn']);
         associateTurn(turn['id']);
-        if (method === 'turn/completed') complete(turn);
+        if (method === 'turn/completed') {
+          terminal = true;
+          complete(turn);
+        }
       } else if (method === 'item/completed') {
         associateTurn(parameters['turnId']);
         const item = object(parameters['item']);
@@ -214,9 +232,10 @@ async function runCodex(
       );
     }
   });
-  lines.on('close', () =>
-    fail(new Error('Codex protocol closed before completion.')),
-  );
+  lines.on('close', () => {
+    if (!terminal || pending.size > 0)
+      fail(new Error('Codex protocol closed before completion.'));
+  });
   const initTimer = setTimeout(
     () => fail(new Error('Codex initialization timed out.')),
     10_000,
@@ -266,18 +285,36 @@ async function runCodex(
   } finally {
     clearTimeout(initTimer);
     clearTimeout(executionTimer);
+    clearTimeout(exitDrainTimer);
+    child.removeListener('exit', onExit);
     signal.removeEventListener('abort', abort);
     lines.close();
     for (const reply of pending.values())
       reply.reject(new Error('Codex connection closed.'));
     pending.clear();
-    await tracked.terminate().catch((error: unknown) => {
-      if (!isExpectedExternalAgentCleanupExit(error)) {
-        throw new Error(
-          `Codex cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    });
+    await tracked
+      .terminate()
+      .catch((error: unknown) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (isUnprovenExternalAgentTreeExit(error)) {
+          const diagnostic = `Codex process tree not proven gone after cleanup: ${detail}`;
+          debugLogger.warn(diagnostic);
+          if (params.eventEmitter?.rawListeners(AgentEventType.ERROR).length) {
+            params.eventEmitter.emit(AgentEventType.ERROR, {
+              subagentId: params.subagentId ?? params.name,
+              error: diagnostic,
+              timestamp: Date.now(),
+            });
+          }
+        } else if (!isExpectedExternalAgentCleanupExit(error)) {
+          throw new Error(`Codex cleanup failed: ${detail}`);
+        }
+      })
+      .finally(() => {
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+      });
   }
 }
 
@@ -315,6 +352,7 @@ class CodexSubagentExecutor implements SubagentExecutor {
       case 'plan':
         this.sandbox = 'read-only';
         break;
+      case 'auto':
       case 'auto-edit':
         this.sandbox = 'workspace-write';
         break;
@@ -368,14 +406,14 @@ class CodexSubagentExecutor implements SubagentExecutor {
       );
       const task = String(context.get('task_prompt') ?? 'Get Started!');
       this.finalText = await runCodex(
-        this.params,
+        { ...this.params, eventEmitter: this.emitter },
         [system, task].filter(Boolean).join('\n\n'),
         this.sandbox,
         this.controller.signal,
       );
-      if (this.controller.signal.aborted)
-        throw new CodexInterruption(AgentTerminateMode.CANCELLED);
-      this.terminateMode = AgentTerminateMode.GOAL;
+      this.terminateMode = this.controller.signal.aborted
+        ? AgentTerminateMode.CANCELLED
+        : AgentTerminateMode.GOAL;
     } catch (error) {
       this.terminateMode =
         error instanceof CodexInterruption
